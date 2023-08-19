@@ -95,8 +95,8 @@ class TrajectoryCost(nn.Module):
             ee_rot_diag = torch.block_diag(*ee_rot_traj)
             ee_goal_rot_diag = torch.block_diag(*ee_goal_rot_traj)
             ee_pos_col = ee_pos_traj.view(-1, 1)
-            ee_goal_pos_col = ee_goal_pos_traj.view(-1, 1)
-            ee_rot_col = ee_rot_traj.view(-1, 3)
+            ee_goal_pos_col = ee_goal_pos_traj.reshape(-1, 1)
+            ee_rot_col = ee_rot_traj.reshape(-1, 3)
 
             # convention: x_T_y -> transformation from frame y to x
 

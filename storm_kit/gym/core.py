@@ -21,26 +21,31 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.#
 import numpy as np
+import torch
 try:
     from  isaacgym import gymapi
     from isaacgym import gymutil
+    from isaacgym import gymtorch
 except Exception:
     print("ERROR: gym not loaded, this is okay when generating docs")
 
 from quaternion import from_rotation_matrix
 
 from .helpers import load_struct_from_dict
+from storm_kit.differentiable_robot_model.coordinate_transform import quaternion_to_matrix, matrix_to_quaternion, CoordinateTransform
 
 class Gym(object):
-    def __init__(self,sim_params={}, physics_engine='physx', compute_device_id=0, graphics_device_id=1, num_envs=1, headless=False, **kwargs):
+    def __init__(self, sim_params={}, physics_engine='physx', compute_device_id=0, graphics_device_id=1, num_envs=1, headless=False, **kwargs):
 
         if(physics_engine=='physx'):
             physics_engine = gymapi.SIM_PHYSX
         elif(physics_engine == 'flex'):
             physics_engine = gymapi.SIM_FLEX
+
         # create physics engine struct
         sim_engine_params = gymapi.SimParams()
-        
+        sim_engine_params.use_gpu_pipeline = True
+        sim_engine_params.physx.use_gpu = True
         # find params in kwargs and fill up here:
         sim_engine_params = load_struct_from_dict(sim_engine_params, sim_params)
         self.headless = headless
@@ -51,26 +56,23 @@ class Gym(object):
                                        physics_engine,
                                        sim_engine_params)
 
-        self.env_list = []#None
+        self.env_list = []
         self.viewer = None
         self._create_envs(num_envs, num_per_row=int(np.sqrt(num_envs)))
+
         if(not headless):
             self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
             cam_pos = gymapi.Vec3(-1.5, 1.8, 1.2)
             cam_target = gymapi.Vec3(6, 0.0, -6)
-            #cam_pos = gymapi.Vec3(2, 2.0, -2)
-            #cam_target = gymapi.Vec3(-6, 0.0,6)
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
-        #self.gym.add_ground(self.sim, gymapi.PlaneParams())
 
         self.dt = sim_engine_params.dt
+
     def step(self):
-        
         ## step through the physics regardless, only apply torque when sim time matches the real time
         self.gym.simulate(self.sim)
         self.gym.fetch_results(self.sim, True)
 
-        #if self.mode == 'human':
         # update the viewer
         if(not self.headless):
             self.gym.step_graphics(self.sim)
@@ -88,11 +90,14 @@ class Gym(object):
                 self.sim, lower, upper, num_per_row
             )
             self.env_list.append(env_ptr)
+
     def get_sim_time(self):
         return self.gym.get_sim_time(self.sim)
+    
     def clear_lines(self):
         if(self.viewer is not None):
             self.gym.clear_lines(self.viewer)
+    
     def draw_lines(self, pts, color=[0.5,0.0,0.0], env_idx=0, w_T_l=None):
         if(self.viewer is None):
             return
@@ -109,16 +114,14 @@ class Gym(object):
                 verts[i][1] = w_T_l * verts[i][1]
             colors[i] = (color[0], color[1], color[2])
 
-        
-
         self.gym.add_lines(self.viewer,self.env_list[env_idx],pts.shape[0] - 1,verts, colors)
-        #self.gym.add_lines(self.viewer,self.env_list[env_idx],pts.shape[0] - 1,verts, colors)
 
 class World(object):
-    def __init__(self, gym_instance, sim_instance, env_ptr, world_params=None, w_T_r=None):
+    def __init__(self, gym_instance, sim_instance, env_ptr, world_params=None, w_T_r=None, tensor_args={'device':"cpu", 'dtype':torch.float32}):
         self.gym = gym_instance
         self.sim = sim_instance
         self.env_ptr = env_ptr
+        self.tensor_args = tensor_args
         
         self.radius = []
         self.position = []
@@ -140,16 +143,10 @@ class World(object):
             radius = spheres[obj]['radius']
             position = spheres[obj]['position']
 
-            
-            
-            # get pose
-            
             object_pose = gymapi.Transform()
             object_pose.p = gymapi.Vec3(position[0], position[1], position[2])
             object_pose.r = gymapi.Quat(0, 0, 0,1)
             object_pose = w_T_r * object_pose
-
-            #
 
             obj_asset = gym_instance.create_sphere(sim_instance,radius, asset_options)
             obj_handle = gym_instance.create_actor(env_ptr, obj_asset, object_pose, obj, 2, 2, self.ENV_SEG_LABEL)
@@ -161,13 +158,9 @@ class World(object):
                 dims = cube[obj]['dims']
                 pose = cube[obj]['pose']
                 self.add_table(dims, pose, color=color)
-            
-
     
     def add_table(self, table_dims, table_pose, color=[1.0,0.0,0.0]):
-
         table_dims = gymapi.Vec3(table_dims[0], table_dims[1], table_dims[2])
-
         asset_options = gymapi.AssetOptions()
         asset_options.armature = 0.001
         asset_options.fix_base_link = True
@@ -178,7 +171,6 @@ class World(object):
         pose.r = gymapi.Quat(table_pose[3], table_pose[4], table_pose[5], table_pose[6])
         table_asset = self.gym.create_box(self.sim, table_dims.x, table_dims.y, table_dims.z,
                                           asset_options)
-
         table_pose = self.robot_pose * pose
         table_handle = self.gym.create_actor(self.env_ptr, table_asset, table_pose,'table',
                                              2,2,self.ENV_SEG_LABEL)
@@ -189,10 +181,6 @@ class World(object):
         asset_options = gymapi.AssetOptions()
         asset_options.armature = 0.001
         asset_options.fix_base_link = True
-        #pose = gymapi.Transform()
-        #pose.p = gymapi.Vec3(pose[0], pose[1], pose[2])
-        #pose.r = gymapi.Quat(pose[3], pose[4], pose[5], pose[6])
-        
         obj_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
         obj_handle = self.gym.create_actor(self.env_ptr, obj_asset, pose,name,
                                            2,2,self.BG_SEG_LABEL)
@@ -200,6 +188,17 @@ class World(object):
 
     def get_pose(self, body_handle):
         pose = self.gym.get_rigid_transform(self.env_ptr, body_handle)
-        #pose = pose.p
-
         return pose
+    
+    def set_root_tensor_state(self, pose, actor_handle):
+        _root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
+        root_tensor = gymtorch.wrap_tensor(_root_tensor)
+        quat = matrix_to_quaternion(pose[:3, :3].unsqueeze(0))[0]
+        quat_formatted = quat.clone()
+        quat_formatted[:3] = quat[1:]
+        quat_formatted[-1] = quat[0]
+        state = torch.zeros(13, **self.tensor_args)
+        idx = self.gym.get_actor_index(self.env_ptr, actor_handle, gymapi.DOMAIN_SIM)
+        root_tensor[idx, :3] = pose[:3, 3]
+        root_tensor[idx, 3:7] = quat_formatted
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_tensor))

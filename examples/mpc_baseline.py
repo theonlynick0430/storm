@@ -51,8 +51,8 @@ np.set_printoptions(precision=2)
 
 # helper methods (general rule use torch structs until passing through gym api)
 def transform_to_torch(transform, tensor_args):
-    mat = torch.eye(4, dtype=tensor_args['dtype'])
-    quat = torch.tensor([transform.r.w, transform.r.x, transform.r.y, transform.r.z], dtype=tensor_args['dtype']).unsqueeze(0)
+    mat = torch.eye(4, **tensor_args)
+    quat = torch.tensor([transform.r.w, transform.r.x, transform.r.y, transform.r.z], **tensor_args).unsqueeze(0)
     rot_mat = quaternion_to_matrix(quat)[0]
     mat[0,3] = transform.p.x
     mat[1,3] = transform.p.y
@@ -66,20 +66,22 @@ def torch_to_transform(mat):
     return gymapi.Transform(vec3, quat)
 
 def quat_to_torch(quat, tensor_args):
-    return torch.tensor([quat.w, quat.x, quat.y, quat.z], dtype=tensor_args['dtype']) # assume wxyz format
+    return torch.tensor([quat.w, quat.x, quat.y, quat.z], **tensor_args) # assume wxyz format
 
 def torch_to_quat(arr):
-    return gymapi.Quat(arr[1], arr[2], arr[3], arr[0]) # xyzw format
+    arr_cpu = arr.cpu()
+    return gymapi.Quat(arr_cpu[1], arr_cpu[2], arr_cpu[3], arr_cpu[0]) # xyzw format
 
 def vec3_to_torch(vec3, tensor_args):
-    return torch.tensor([vec3.x, vec3.y, vec3.z], dtype=tensor_args['dtype'])
+    return torch.tensor([vec3.x, vec3.y, vec3.z], **tensor_args)
 
 def torch_to_vec3(arr):
-    return gymapi.Vec3(arr[0], arr[1], arr[2])
+    arr_cpu = arr.cpu()
+    return gymapi.Vec3(arr_cpu[0], arr_cpu[1], arr_cpu[2])
 
 def pose_from(pos, quat, tensor_args):
     rot_mat = quaternion_to_matrix(quat.unsqueeze(0))[0]
-    pose = torch.eye(4, dtype=tensor_args['dtype'])
+    pose = torch.eye(4, **tensor_args)
     pose[:3, :3] = rot_mat
     pose[:3, 3] = pos
     return pose
@@ -88,22 +90,22 @@ def get_ee_targets(robot_state, mpc_control, tensor_args):
     state = np.hstack((robot_state['position'], robot_state['velocity'], robot_state['acceleration']))
     state_t = torch.as_tensor(state, **tensor_args).unsqueeze(0)
     pose_state = mpc_control.controller.rollout_fn.get_ee_pose(state_t)
-    pos = pose_state['ee_pos_seq'].cpu()[0]
-    quat = pose_state['ee_quat_seq'].cpu()[0]
+    pos = pose_state['ee_pos_seq'][0]
+    quat = pose_state['ee_quat_seq'][0]
     rot_mat = quaternion_to_matrix(quat.unsqueeze(0))[0]
     return pos, rot_mat # in robot frame
 
 def get_ee_goal_pose(mpc_control, w_T_r, tensor_args):
-    pos = mpc_control.controller.rollout_fn.goal_ee_pos.cpu()[0]
-    quat = mpc_control.controller.rollout_fn.goal_ee_quat.cpu()[0]
+    pos = mpc_control.controller.rollout_fn.goal_ee_pos[0]
+    quat = mpc_control.controller.rollout_fn.goal_ee_quat[0]
     return w_T_r @ pose_from(pos, quat, tensor_args) # in world frame
 
 def get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args):
     state = np.hstack((robot_state['position'], robot_state['velocity'], robot_state['acceleration']))
     state_t = torch.as_tensor(state, **tensor_args).unsqueeze(0)
     pose_state = mpc_control.controller.rollout_fn.get_ee_pose(state_t)
-    pos = pose_state['ee_pos_seq'].cpu()[0]
-    quat = pose_state['ee_quat_seq'].cpu()[0]
+    pos = pose_state['ee_pos_seq'][0]
+    quat = pose_state['ee_quat_seq'][0]
     return w_T_r @ pose_from(pos, quat, tensor_args) # in world frame
 
 def draw_mpc_top_trajs(gym_instance, mpc_control, w_robot_coord: CoordinateTransform):
@@ -145,14 +147,14 @@ def main(args, gym_instance):
     data_file = args.input
     trajs = list(np.load(data_file, allow_pickle=True).item().values())
     traj = trajs[args.trajectory]
-    traj = torch.tensor(traj, dtype=tensor_args['dtype'])
+    traj = torch.tensor(traj, **tensor_args)
 
     # create robot sim: wrapper around isaac sim to add/manage single robot 
-    robot_sim = RobotSim(gym_instance=gym, sim_instance=sim, **sim_params, device="cuda")
+    env_ptr = gym_instance.env_list[0]
+    robot_sim = RobotSim(env_handle=env_ptr, gym_instance=gym, sim_instance=sim, **sim_params, tensor_args=tensor_args)
     # spawn robot
     robot_pose = sim_params['robot_pose']
-    env_ptr = gym_instance.env_list[0]
-    robot_ptr = robot_sim.spawn_robot(env_ptr, robot_pose, coll_id=2)
+    robot_ptr = robot_sim.spawn_robot(robot_pose, coll_id=2)
     
     # get world transform
     # convention x_T_y is transformation from frame x to y
@@ -160,35 +162,39 @@ def main(args, gym_instance):
     w_robot_coord = CoordinateTransform(trans=w_T_r[0:3,3].unsqueeze(0),
                                         rot=w_T_r[0:3,0:3].unsqueeze(0))
     # create world: wrapper around isaac sim to add/manage objects
-    world_instance = World(gym, sim, env_ptr, world_params, w_T_r=torch_to_transform(w_T_r))
+    world_instance = World(gym, sim, env_ptr, world_params, w_T_r=torch_to_transform(w_T_r), tensor_args=tensor_args)
 
     # mpc control 
     mpc_control = TrajectoryTask(task_file, robot_file, world_file, tensor_args)
 
-    robot_state = copy.deepcopy(robot_sim.get_state(env_ptr, robot_ptr))
-    w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
-
-    # spawn ee object
+    # spawn ee obj
     asset_options = gymapi.AssetOptions()
     asset_options.armature = 0.001
     asset_options.fix_base_link = True
     asset_options.thickness = 0.002
-    ee_T_obj = torch.eye(4, dtype=tensor_args['dtype'])
-    ee_T_obj[:3, 3] = torch.tensor([0., 0., 0.025], dtype=tensor_args['dtype'])
-    cube_pose = w_T_ee @ ee_T_obj
-    obj_grasp = w_T_ee @ torch.inverse(ee_T_obj) @ torch.inverse(w_T_ee)
     cube_color = gymapi.Vec3(51., 153., 255.)/255.
     cube_asset = gym.create_box(sim, 0.05, 0.05, 0.05, asset_options)
-    cube_handle = gym.create_actor(env_ptr, cube_asset, torch_to_transform(cube_pose), 'ee_cube', 2, 2, world_instance.ENV_SEG_LABEL)
+    cube_handle = gym.create_actor(env_ptr, cube_asset, torch_to_transform(torch.eye(4, **tensor_args)), 'ee_cube', 2, 2, world_instance.ENV_SEG_LABEL)
     cube_body_handle = gym.get_actor_rigid_body_handle(env_ptr, cube_handle, 0)
     gym.set_rigid_body_color(env_ptr, cube_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, cube_color)
 
+    # start tensor api (all sim done on gpu)
+    gym.prepare_sim(sim)
+    robot_sim.init_tensor_api()
+
+    # set transformation for ee obj
+    robot_state = copy.deepcopy(robot_sim.get_state())
+    w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
+    ee_T_obj = torch.eye(4, **tensor_args)
+    ee_T_obj[:3, 3] = torch.tensor([0., 0., 0.025], **tensor_args)
+    cube_pose = w_T_ee @ ee_T_obj
+    obj_grasp = w_T_ee @ torch.inverse(ee_T_obj) @ torch.inverse(w_T_ee)
+    gym.refresh_actor_root_state_tensor(sim)
+    world_instance.set_root_tensor_state(cube_pose, cube_handle)
+    # gym.set_rigid_transform(env_ptr, cube_body_handle, torch_to_transform(cube_pose))
+
     # set mpc to traj
-    # ee_pos_target, ee_rot_target = get_ee_targets(robot_state, mpc_control, tensor_args)
-    # ee_pos_target[0] += 0.25
-    # ee_goal_pos_traj=ee_pos_target.unsqueeze(0).expand(horizon, -1)
-    # ee_goal_rot_traj=ee_rot_target.unsqueeze(0).expand(horizon, -1, -1)
-    w_t_ee = torch.eye(4, dtype=tensor_args['dtype'])
+    w_t_ee = torch.eye(4, **tensor_args)
     w_t_ee[:3, 3] = w_T_ee[:3, 3]
     traj = w_t_ee @ ee_T_obj @ traj # traj now in world frame
     ee_goal_pose_traj = torch.inverse(w_T_r) @ obj_grasp @ traj
@@ -202,9 +208,15 @@ def main(args, gym_instance):
     traj_t_step = 0
     traj_freq = int(real_dt/sim_dt)
     counter: int = 0
-    while t_step >= 0:
+    while not gym.query_viewer_has_closed(gym_instance.viewer):
         try:
             gym_instance.step()
+            # refresh tensors
+            gym.refresh_actor_root_state_tensor(sim)
+            gym.refresh_rigid_body_state_tensor(sim)
+            gym.refresh_dof_state_tensor(sim)
+            gym.refresh_jacobian_tensors(sim)
+            gym.refresh_mass_matrix_tensors(sim)
             t_step += sim_dt
             counter += 1
 
@@ -215,12 +227,13 @@ def main(args, gym_instance):
                 traj_t_step = min(traj_t_step, traj.shape[0]-1)
                 mpc_control.update_params(active_idx=traj_t_step)
             
-            robot_state = copy.deepcopy(robot_sim.get_state(env_ptr, robot_ptr))
+            robot_state = copy.deepcopy(robot_sim.get_state())
             w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
             cube_pose = w_T_ee @ ee_T_obj
 
             # update ee object
-            gym.set_rigid_transform(env_ptr, cube_body_handle, torch_to_transform(cube_pose))
+            world_instance.set_root_tensor_state(cube_pose, cube_handle)
+            # gym.set_rigid_transform(env_ptr, cube_body_handle, torch_to_transform(cube_pose))
         
             # run mpc to find optimal action
             command = mpc_control.get_command(t_step, robot_state, control_dt=sim_dt, WAIT=True)
@@ -231,7 +244,7 @@ def main(args, gym_instance):
             gym_instance.clear_lines()
             draw_mpc_top_trajs(gym_instance, mpc_control, w_robot_coord)
             # execute action
-            robot_sim.command_robot_position(q_des, env_ptr, robot_ptr)            
+            robot_sim.command_robot_position(torch.tensor(q_des, **tensor_args))  
 
             # ee_error = mpc_control.get_current_error(robot_state)
             # print(["{:.3f}".format(x) for x in ee_error], "{:.3f}".format(mpc_control.opt_dt),

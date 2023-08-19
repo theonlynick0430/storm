@@ -31,6 +31,7 @@ from quaternion import from_rotation_matrix, as_float_array, as_rotation_matrix,
 try:
     from  isaacgym import gymapi
     from isaacgym import gymutil
+    from isaacgym import gymtorch
 except Exception:
     print("ERROR: gym not loaded, this is okay when generating doc")
 
@@ -65,11 +66,12 @@ def pose_from_gym(gym_pose):
     return pose
 
 class RobotSim():
-    def __init__(self, device='cpu', gym_instance=None, sim_instance=None,
+    def __init__(self, env_handle=None, tensor_args={'device':"cpu", 'dtype':torch.float32}, gym_instance=None, sim_instance=None,
                  asset_root='', sim_urdf='', asset_options='', init_state=None, collision_model=None, **kwargs):
+        self.env_handle = env_handle
         self.gym = gym_instance
         self.sim = sim_instance
-        self.device = device
+        self.tensor_args = tensor_args
         self.dof = None
         self.init_state = init_state
         self.joint_names = []
@@ -85,46 +87,42 @@ class RobotSim():
         self.robot_asset = self.load_robot_asset(sim_urdf,
                                                  robot_asset_options,
                                                  asset_root)
-
         
-    def init_sim(self, gym_instance, sim_instance):
+    def init_sim(self, env_handle, gym_instance, sim_instance):
+        self.env_handle = env_handle
         self.gym = gym_instance
         self.sim = sim_instance
         
     def load_robot_asset(self, sim_urdf, asset_options, asset_root):
-
         if ((self.gym is None) or (self.sim is None)):
             raise AssertionError
         robot_asset = self.gym.load_asset(self.sim, asset_root,
                                           sim_urdf, asset_options)
-        #print(asset_options.disable_gravity)
         return robot_asset
 
-    def spawn_robot(self, env_handle, robot_pose, robot_asset=None, coll_id=-1, init_state=None):
+    def spawn_robot(self, robot_pose, robot_asset=None, coll_id=-1, init_state=None):
         p = gymapi.Vec3(robot_pose[0], robot_pose[1], robot_pose[2])
         robot_pose = gymapi.Transform(p=p, r=gymapi.Quat(robot_pose[3], robot_pose[4], robot_pose[5], robot_pose[6]))
         self.spawn_robot_pose = robot_pose
-        # also store inverse:
-        #self.inv_robot_pose = self.spawn_robot_pose.inverse()
         
         if(robot_asset is None):
             robot_asset = self.robot_asset
-        robot_handle = self.gym.create_actor(env_handle, robot_asset,
+        self.robot_handle = self.gym.create_actor(self.env_handle, robot_asset,
                                              robot_pose, 'robot', coll_id, coll_id, self.ROBOT_SEG_LABEL) # coll_id, mask_filter, mask_vision
 
         # set friction prop:
-        shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, robot_handle)
+        shape_props = self.gym.get_actor_rigid_shape_properties(self.env_handle, self.robot_handle)
         for i in range(len(shape_props)):
             shape_props[i].friction = 1.5
-        self.gym.set_actor_rigid_shape_properties(env_handle,robot_handle,shape_props)
+        self.gym.set_actor_rigid_shape_properties(self.env_handle,self.robot_handle,shape_props)
         
         # set initial position:
-        robot_joint_names = self.gym.get_actor_dof_names(env_handle, robot_handle)
+        robot_joint_names = self.gym.get_actor_dof_names(self.env_handle, self.robot_handle)
         self.joint_names = robot_joint_names
             
         # todo - move to shared data
         # get joint limits and ranges for robot
-        robot_dof_props = self.gym.get_actor_dof_properties(env_handle, robot_handle)
+        robot_dof_props = self.gym.get_actor_dof_properties(self.env_handle, self.robot_handle)
 
         self.dof = len(robot_dof_props['effort'])
 
@@ -150,56 +148,59 @@ class RobotSim():
         robot_dof_props['stiffness'][-2:] = 100.0
         robot_dof_props['damping'][-2:] = 5.0
         
-
-        self.gym.set_actor_dof_properties(env_handle, robot_handle, robot_dof_props)            
+        self.gym.set_actor_dof_properties(self.env_handle, self.robot_handle, robot_dof_props)         
         
-        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(env_handle, robot_handle,
+        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(self.env_handle, self.robot_handle,
                                                                        gymapi.STATE_ALL))
-
+        
         for i in range(len(robot_dof_states['pos'])):
             robot_dof_states['pos'][i] = self.init_state[i]
             robot_dof_states['vel'][i] = 0.0
         self.init_robot_state = robot_dof_states
-        self.gym.set_actor_dof_states(env_handle, robot_handle, robot_dof_states, gymapi.STATE_ALL)
+        self.gym.set_actor_dof_states(self.env_handle, self.robot_handle, robot_dof_states, gymapi.STATE_ALL)
 
         if(self.collision_model_params is not None):
-            self.init_collision_model(self.collision_model_params, env_handle, robot_handle)
+            self.init_collision_model(self.collision_model_params, self.env_handle, self.robot_handle)
 
-        return robot_handle
-    def get_state(self, env_handle, robot_handle):
-        robot_state = self.gym.get_actor_dof_states(env_handle, robot_handle, gymapi.STATE_ALL)
-        
+        self.dof_count = self.gym.get_actor_dof_count(self.env_handle, self.robot_handle)
+
+        return self.robot_handle
+    
+    def init_tensor_api(self):
+        self.dof_idx = self.gym.get_actor_dof_index(self.env_handle, self.robot_handle, 0, gymapi.DOMAIN_SIM)
+        self.sim_dof_count = self.gym.get_sim_dof_count(self.sim)
+        self.actor_indices = gymtorch.unwrap_tensor(torch.arange(self.dof_idx, self.dof_idx+self.dof_count, 
+                                                                 dtype=torch.int32, device=self.tensor_args['device']))
+    
+    def get_state(self):
+        _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        dof_states = gymtorch.wrap_tensor(_dof_states).cpu().numpy()
         # reformat state to be similar ros jointstate:
         joint_state = {'name':self.joint_names, 'position':[], 'velocity':[], 'acceleration':[]}
-
-        for i in range(len(robot_state)):
-            joint_state['position'].append(robot_state[i][0])
-            joint_state['velocity'].append(robot_state[i][1])
-        joint_state['position'] = np.ravel(joint_state['position'])
-        joint_state['velocity'] = np.ravel(joint_state['velocity'])
-        joint_state['acceleration'] = np.ravel(joint_state['velocity'])*0.0
-        
+        joint_state['position'] = dof_states[self.dof_idx:self.dof_idx+self.dof_count, 0]
+        joint_state['velocity'] = dof_states[self.dof_idx:self.dof_idx+self.dof_count, 1]
+        joint_state['acceleration'] = np.zeros_like(joint_state['velocity'])
         return joint_state
-    
 
-    def command_robot(self, tau, env_handle, robot_handle):
-        self.gym.apply_actor_dof_efforts(env_handle, robot_handle, np.float32(tau))
-        
-    def command_robot_position(self, q_des, env_handle, robot_handle):
-        self.gym.set_actor_dof_position_targets(env_handle, robot_handle, np.float32(q_des))
+    def command_robot(self, effort):
+        effort_action = torch.zeros(self.sim_dof_count, **self.tensor_args)
+        effort_action[self.dof_idx:self.dof_idx+self.dof_count-2] = effort
+        self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(effort_action.contiguous()))
+                
+    def command_robot_position(self, pos):
+        _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        pos_action = gymtorch.wrap_tensor(_dof_states)[:, 0]
+        pos_action[self.dof_idx:self.dof_idx+self.dof_count] = pos
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action.contiguous()))
 
+    def command_robot_state(self, pos, vel):
+        _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        state_action = gymtorch.wrap_tensor(_dof_states)
+        state_action[self.dof_idx:self.dof_idx+self.dof_count, 0] = pos
+        state_action[self.dof_idx:self.dof_idx+self.dof_count, 1] = vel
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(state_action.contiguous()))  
 
-    def set_robot_state(self, q_des, qd_des, env_handle, robot_handle):
-        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(env_handle, robot_handle,
-                                                                       gymapi.STATE_ALL))
-
-        for i in range(len(robot_dof_states['pos'])):
-            robot_dof_states['pos'][i] = q_des[i]
-            robot_dof_states['vel'][i] = qd_des[i]
-        self.init_robot_state = robot_dof_states
-        self.gym.set_actor_dof_states(env_handle, robot_handle, robot_dof_states, gymapi.STATE_ALL)
-
-    def update_collision_model(self, link_poses, env_ptr, robot_handle):
+    def update_collision_model(self, link_poses):
         w_T_r = self.spawn_robot_pose
         for i in range(len(link_poses)):
             #print(i)
@@ -208,12 +209,11 @@ class RobotSim():
             link_pose.p = gymapi.Vec3(link_poses[i][0], link_poses[i][1], link_poses[i][2])
             link_pose.r = gymapi.Quat(link_poses[i][4], link_poses[i][5], link_poses[i][6],link_poses[i][3])
             w_p1 = w_T_r * link_pose * link['pose_offset'] * link['base']
-            self.gym.set_rigid_transform(env_ptr, link['p1_body_handle'], w_p1)
+            self.gym.set_rigid_transform(self.env_handle, link['p1_body_handle'], w_p1)
             w_p2 = w_T_r * link_pose * link['pose_offset'] * link['tip']
-            self.gym.set_rigid_transform(env_ptr, link['p2_body_handle'], w_p2)
+            self.gym.set_rigid_transform(self.env_handle, link['p2_body_handle'], w_p2)
 
-    def init_collision_model(self, robot_collision_params, env_ptr, robot_handle):
-        
+    def init_collision_model(self, robot_collision_params):
         # get robot w_T_r
         w_T_r = self.spawn_robot_pose
         # transform all points based on this:
@@ -245,17 +245,17 @@ class RobotSim():
             pt1_pose = gymapi.Transform()
             pt1_pose.p = gymapi.Vec3(base[0], base[1], base[2])
             link_p1_asset = self.gym.create_sphere(self.sim, r, asset_options)
-            link_p1_handle = self.gym.create_actor(env_ptr, link_p1_asset,w_T_r * pose_offset * pt1_pose, j, 2, 2)
-            self.gym.set_rigid_body_color(env_ptr, link_p1_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION,
+            link_p1_handle = self.gym.create_actor(self.env_handle, link_p1_asset,w_T_r * pose_offset * pt1_pose, j, 2, 2)
+            self.gym.set_rigid_body_color(self.env_handle, link_p1_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION,
                                           obs_color)
-            link_p1_body = self.gym.get_actor_rigid_body_handle(env_ptr, link_p1_handle, 0)
+            link_p1_body = self.gym.get_actor_rigid_body_handle(self.env_handle, link_p1_handle, 0)
             
             pt2_pose = gymapi.Transform()
             pt2_pose.p = gymapi.Vec3(tip[0], tip[1], tip[2])
             link_p2_asset = self.gym.create_sphere(self.sim, r, asset_options)
-            link_p2_handle = self.gym.create_actor(env_ptr, link_p2_asset, w_T_r * pose_offset * pt2_pose, j, 2, 2)
-            link_p2_body = self.gym.get_actor_rigid_body_handle(env_ptr, link_p2_handle, 0)
-            self.gym.set_rigid_body_color(env_ptr, link_p2_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION,
+            link_p2_handle = self.gym.create_actor(self.env_handle, link_p2_asset, w_T_r * pose_offset * pt2_pose, j, 2, 2)
+            link_p2_body = self.gym.get_actor_rigid_body_handle(self.env_handle, link_p2_handle, 0)
+            self.gym.set_rigid_body_color(self.env_handle, link_p2_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION,
                                           obs_color)
         
     
@@ -263,11 +263,11 @@ class RobotSim():
                          'p1_body_handle':link_p1_body, 'p2_body_handle': link_p2_body}
             self.link_colls.append(link_coll)
 
-    def spawn_camera(self, env_ptr, fov, width, height, robot_camera_pose):
+    def spawn_camera(self, fov, width, height, robot_camera_pose):
         """
         Spawn a camera in the environment
         Args:
-        env_ptr: environment pointer
+        self.env_handle: environment pointer
         fov, width, height: camera params
         robot_camera_pose: Camera pose w.r.t robot_body_handle [x, y, z, qx, qy, qz, qw]
         """
@@ -278,7 +278,7 @@ class RobotSim():
         camera_props.use_collision_geometry = False
 
         self.num_cameras = 1
-        camera_handle = self.gym.create_camera_sensor(env_ptr, camera_props)
+        camera_handle = self.gym.create_camera_sensor(self.env_handle, camera_props)
         robot_camera_pose = gymapi.Transform(
             gymapi.Vec3(robot_camera_pose[0], robot_camera_pose[1], robot_camera_pose[2]),
             gymapi.Quat(robot_camera_pose[3], robot_camera_pose[4], robot_camera_pose[5], robot_camera_pose[6]))
@@ -290,22 +290,20 @@ class RobotSim():
         #print('Spawn camera pose:',world_camera_pose.p)
         self.gym.set_camera_transform(
             camera_handle,
-            env_ptr,
+            self.env_handle,
             world_camera_pose)
 
         self.camera_handle = camera_handle
         
         return camera_handle
-
         
-        
-    def observe_camera(self, env_ptr):
+    def observe_camera(self):
         self.gym.render_all_camera_sensors(self.sim)
         self.current_env_observations = []
         
         camera_handle = self.camera_handle
 
-        w_c_mat = self.gym.get_camera_view_matrix(self.sim, env_ptr, camera_handle).T
+        w_c_mat = self.gym.get_camera_view_matrix(self.sim, self.env_handle, camera_handle).T
         #print('View matrix',w_c_mat)
         #p = gymapi.Vec3(w_c_mat[3,0], w_c_mat[3,1], w_c_mat[3,2])
         #p = gymapi.Vec3(w_c_mat[0,3], w_c_mat[1,3], w_c_mat[2,3])
@@ -314,9 +312,9 @@ class RobotSim():
         camera_pose = self.spawn_robot_pose.inverse()
 
         proj_matrix = self.gym.get_camera_proj_matrix(
-            self.sim, env_ptr, camera_handle
+            self.sim, self.env_handle, camera_handle
         )
-        view_matrix = self.gym.get_camera_view_matrix(self.sim, env_ptr, camera_handle)#.T
+        view_matrix = self.gym.get_camera_view_matrix(self.sim, self.env_handle, camera_handle)#.T
         #view_matrix = view_matrix_t
         #view_matrix[0:3,3] = view_matrix_t[3,0:3]
         #view_matrix[3,0:3] = 0.0
@@ -327,14 +325,14 @@ class RobotSim():
         
         color_image = self.gym.get_camera_image(
             self.sim,
-            env_ptr,
+            self.env_handle,
             camera_handle,
             gymapi.IMAGE_COLOR)
         color_image = np.reshape(color_image, [480, 640, 4])[:, :, :3]
 
         depth_image = self.gym.get_camera_image(
             self.sim,
-            env_ptr,
+            self.env_handle,
             camera_handle,
             gymapi.IMAGE_DEPTH,
         )
@@ -342,7 +340,7 @@ class RobotSim():
         #depth_image[depth_image > self.DEPTH_CLIP_RANGE] = 0
         segmentation = self.gym.get_camera_image(
             self.sim,
-            env_ptr,
+            self.env_handle,
             camera_handle,
             gymapi.IMAGE_SEGMENTATION,
         )
