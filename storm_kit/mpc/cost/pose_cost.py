@@ -76,20 +76,21 @@ class PoseCost(nn.Module):
         ee_goal_rot = ee_goal_rot.to(device=self.device,
                                      dtype=self.dtype)
         
-        #Inverse of goal transform
-        R_g_t = ee_goal_rot.transpose(-2,-1) # w_R_g -> g_R_w
-        R_g_t_d = (-1.0 * R_g_t @ ee_goal_pos.t()).transpose(-2,-1) # -g_R_w * w_d_g -> g_d_g
+        # convention: x_T_y -> transformation from frame y to x
+
+        R_g_t = ee_goal_rot.transpose(-2,-1) # w_R_g
+        R_g_t_d = (-1.0 * R_g_t @ ee_goal_pos.t()).transpose(-2,-1) # trans from origin to goal in world frame
 
         
         #Rotation part
-        R_g_ee = R_g_t @ ee_rot_batch # g_R_w * w_R_ee -> g_R_ee
+        R_g_ee = R_g_t @ ee_rot_batch # ee_R_g
         
         
         #Translation part
         # transpose is done for matmul
-        term1 = (R_g_t @ ee_pos_batch.transpose(-2,-1)).transpose(-2,-1) # g_R_w * w_d_ee -> g_d_ee
-        d_g_ee = term1 + R_g_t_d # g_d_g + g_d_ee
-        goal_dist = torch.norm(self.pos_weight * d_g_ee, p=2, dim=-1, keepdim=True)
+        term1 = (R_g_t @ ee_pos_batch.transpose(-2,-1)).transpose(-2,-1) # trans from ee to origin in world frame
+        d_g_ee = term1 + R_g_t_d # trans from goal to ee in world frame
+        goal_dist = torch.norm(self.pos_weight * d_g_ee, p=2, dim=-1, keepdim=True) # l2 norm
         
         position_err = (torch.sum(torch.square(self.pos_weight * d_g_ee),dim=-1))
         #compute projection error

@@ -174,3 +174,9 @@ docs/setup.rst
 # VIM
 *swp
 *swo
+
+# Apple
+.DS_Store
+
+# Isaac Gym 
+isaacgym/
