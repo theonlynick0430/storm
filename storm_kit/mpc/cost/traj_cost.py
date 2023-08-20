@@ -52,11 +52,14 @@ class TrajectoryCost(nn.Module):
         self.dtype = self.tensor_args['dtype']
         self.device = self.tensor_args['device']
 
-    # arg shapes
-    # ee_pos_batch: (batch_size, x, 3)
-    # ee_rot_batch: (batch_size, x, 3, 3)
-    # ee_goal_pos_traj: (y, 3)
-    # ee_goal_rot_traj: (y, 3, 3))
+    """
+    forward
+    
+    ee_pos_batch: (batch_size, x, 3)
+    ee_rot_batch: (batch_size, x, 3, 3)
+    ee_goal_pos_traj: (y, 3)
+    ee_goal_rot_traj: (y, 3, 3))
+    """
     def forward(self, ee_pos_batch, ee_rot_batch, ee_goal_pos_traj, ee_goal_rot_traj):        
         inp_device = ee_pos_batch.device
         ee_pos_batch = ee_pos_batch.to(device=self.device,

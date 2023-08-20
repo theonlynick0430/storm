@@ -161,7 +161,7 @@ cost:
   retract_weight: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,0.0]
 
 mppi:
-  horizon           : 20
+  horizon           : 15
   init_cov          : 0.005 #.5 #.5
   gamma             : 0.98
   n_iters           : 1
