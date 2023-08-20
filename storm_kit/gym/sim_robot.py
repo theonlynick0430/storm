@@ -39,6 +39,7 @@ import torch
 
 from .helpers import load_struct_from_dict
 from ..util_file import join_path
+from obj_centric_stab.utils import pose_from
 
 def inv_transform(gym_transform):
     mat = np.eye(4)
@@ -181,8 +182,9 @@ class RobotSim():
 
         _rb_states = self.gym.acquire_rigid_body_state_tensor(self.sim)
         self.rb_states = gymtorch.wrap_tensor(_rb_states)
+        # in world frame
         self.ee_pos = self.rb_states[self.rb_idx+self.rb_count-1, :3]
-        self.ee_rot = self.rb_states[self.rb_idx+self.rb_count-1, 3:7]
+        self.ee_quat = self.rb_states[self.rb_idx+self.rb_count-1, 3:7]
         self.ee_vel = self.rb_states[self.rb_idx+self.rb_count-1, 7:]
     
     def get_state(self):
@@ -192,6 +194,9 @@ class RobotSim():
         joint_state['velocity'] = self.dof_vel.cpu().numpy()
         joint_state['acceleration'] = np.zeros_like(joint_state['velocity'])
         return joint_state
+    
+    def get_ee_pose(self):
+        return pose_from(self.ee_pos, self.ee_quat, self.tensor_args)
     
     def command_robot(self, action):
         if self.controller == "osc":
@@ -209,30 +214,24 @@ class RobotSim():
         pos_action[self.dof_idx:self.dof_idx+self.dof] = pos
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action.contiguous()))
 
+    """
+    control
+    
+    dpose: (6, 1)
+        - ee_goal_state-ee_curr_state in world frame
+    """
     def control(self, dpose):
         if self.controller == "osc":
             return self.control_osc(dpose).squeeze(0)
         else: # ik
             return self.dof_pos + self.control_ik(dpose).squeeze(0)
 
-    """
-    control_ik
-    
-    dpose: (6, 1)
-        - ee_goal_state-ee_curr_state in world frame
-    """
     def control_ik(self, dpose):
         j_eef_T = torch.transpose(self.j_eef, 1, 2)
         lmbda = torch.eye(6, **self.tensor_args) * (damping ** 2)
         u = (j_eef_T @ torch.inverse(self.j_eef @ j_eef_T + lmbda) @ dpose).view(1, 7)
         return u
 
-    """
-    control_osc
-    
-    dpose: (6, 1)
-        - ee_goal_state-ee_curr_state in world frame
-    """
     def control_osc(self, dpose):
         mm_inv = torch.inverse(self.mm)
         m_eef_inv = self.j_eef @ mm_inv @ torch.transpose(self.j_eef, 1, 2)

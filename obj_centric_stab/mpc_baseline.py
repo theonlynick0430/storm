@@ -20,13 +20,11 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.#
-""" Example spawning a robot in gym 
+""" MPC for following specified trajectory
 
 """
 import copy
 from isaacgym import gymapi
-from isaacgym import gymutil
-from isaacgym import gymtorch
 import torch
 torch.multiprocessing.set_start_method('spawn',force=True)
 torch.set_num_threads(8)
@@ -35,16 +33,13 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import matplotlib
 matplotlib.use('tkagg')
-import matplotlib.pyplot as plt
 import yaml
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 from storm_kit.gym.core import Gym, World
 from storm_kit.gym.sim_robot import RobotSim
-from storm_kit.util_file import get_configs_path, get_gym_configs_path, join_path, load_yaml, get_assets_path, get_mpc_configs_path
-from storm_kit.gym.helpers import load_struct_from_dict
-from storm_kit.differentiable_robot_model.coordinate_transform import quaternion_to_matrix, matrix_to_quaternion, CoordinateTransform
+from storm_kit.util_file import get_gym_configs_path, join_path, load_yaml, get_assets_path
+from storm_kit.differentiable_robot_model.coordinate_transform import matrix_to_quaternion, CoordinateTransform
 from storm_kit.mpc.task.traj_task import TrajectoryTask
 from obj_centric_stab.utils import *
 from isaacgym.torch_utils import quat_conjugate, quat_mul
@@ -53,16 +48,7 @@ np.set_printoptions(precision=2)
 
 # helper methods (general rule use torch structs until passing through gym api)
 
-def get_ee_targets(robot_state, mpc_control, tensor_args):
-    state = np.hstack((robot_state['position'], robot_state['velocity'], robot_state['acceleration']))
-    state_t = torch.as_tensor(state, **tensor_args).unsqueeze(0)
-    pose_state = mpc_control.controller.rollout_fn.get_ee_pose(state_t)
-    pos = pose_state['ee_pos_seq'][0]
-    quat = pose_state['ee_quat_seq'][0]
-    rot_mat = quaternion_to_matrix(quat.unsqueeze(0))[0]
-    return pos, rot_mat # in robot frame
-
-def get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args):
+def calc_ee_pose(robot_state, mpc_control, w_T_r, tensor_args):
     state = np.hstack((robot_state['position'], robot_state['velocity'], robot_state['acceleration']))
     state_t = torch.as_tensor(state, **tensor_args).unsqueeze(0)
     pose_state = mpc_control.controller.rollout_fn.get_ee_pose(state_t)
@@ -94,7 +80,7 @@ def orientation_error(desired, current):
     q_r = quat_mul(desired, cc)
     return q_r[:, 0:3] * torch.sign(q_r[:, 3]).unsqueeze(-1)
 
-def linear_action(ee_goal_pose, gym_instance, w_T_r, robot_sim: RobotSim, mpc_control, tensor_args, thresh=0.1, max_steps=500):
+def linear_action(ee_goal_pose, robot_sim: RobotSim, gym_instance, thresh=0.1, max_steps=500):
     gym = gym_instance.gym
     sim = gym_instance.sim
     ee_goal_pos = ee_goal_pose[:3, 3].unsqueeze(0)
@@ -105,8 +91,7 @@ def linear_action(ee_goal_pose, gym_instance, w_T_r, robot_sim: RobotSim, mpc_co
         gym_instance.step()
         step += 1
 
-        robot_state = copy.deepcopy(robot_sim.get_state())
-        w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
+        w_T_ee = robot_sim.get_ee_pose()
         ee_quat = matrix_to_quaternion(w_T_ee[:3, :3].unsqueeze(0))
         pos_err = ee_goal_pos - w_T_ee[:3, 3].unsqueeze(0)
         orn_err = orientation_error(ee_goal_quat, ee_quat)
@@ -147,7 +132,7 @@ def main(args, gym_instance):
 
     # create robot sim: wrapper around isaac sim to add/manage single robot 
     env_handle = gym_instance.env_list[0]
-    robot_sim = RobotSim(env_handle=env_handle, gym_instance=gym, sim_instance=sim, **sim_params, tensor_args=tensor_args)
+    robot_sim = RobotSim(env_handle=env_handle, gym_instance=gym_instance, **sim_params, tensor_args=tensor_args)
     # spawn robot
     robot_pose = sim_params['robot_pose']
     robot_handle = robot_sim.spawn_robot(robot_pose, coll_id=2)
@@ -179,8 +164,7 @@ def main(args, gym_instance):
     refresh(gym, sim)
 
     # set transformation for ee obj
-    robot_state = copy.deepcopy(robot_sim.get_state())
-    w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
+    w_T_ee = robot_sim.get_ee_pose()
     ee_T_obj = torch.eye(4, **tensor_args)
     ee_T_obj[:3, 3] = torch.tensor([0., 0., 0.025], **tensor_args)
     obj_pose = w_T_ee @ ee_T_obj
@@ -198,7 +182,7 @@ def main(args, gym_instance):
     t_step = gym_instance.get_sim_time()
     
     # navigate robot to starting pose
-    linear_action(ee_goal_pose_traj[0], gym_instance, w_T_r, robot_sim, mpc_control, tensor_args)
+    linear_action(ee_goal_pose_traj[0], robot_sim, gym_instance)
 
     # main control loop
     sim_dt = mpc_control.exp_params['control_dt']
@@ -221,7 +205,7 @@ def main(args, gym_instance):
                 mpc_control.update_params(active_idx=traj_t_step)
             
             robot_state = copy.deepcopy(robot_sim.get_state())
-            w_T_ee = get_ee_pose(robot_state, mpc_control, w_T_r, tensor_args)
+            w_T_ee = robot_sim.get_ee_pose()
             obj_pose = w_T_ee @ ee_T_obj
 
             # update ee object
@@ -241,7 +225,7 @@ def main(args, gym_instance):
             # mpc does not natively support effort control so we must do conversion for now
             # TODO: effort support for mpc
             if robot_sim.controller == "osc":
-                ee_goal_pose = get_ee_pose(command, mpc_control, w_T_r, tensor_args)
+                ee_goal_pose = calc_ee_pose(command, mpc_control, w_T_r, tensor_args)
                 ee_goal_pos = ee_goal_pose[:3, 3].unsqueeze(0)
                 ee_goal_quat = matrix_to_quaternion(ee_goal_pose[:3, :3].unsqueeze(0))
                 ee_quat = matrix_to_quaternion(w_T_ee[:3, :3].unsqueeze(0))
