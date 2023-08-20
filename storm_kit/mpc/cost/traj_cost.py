@@ -28,12 +28,13 @@ from .gaussian_projection import GaussianProjection
 
 class TrajectoryCost(nn.Module):
 
-    def __init__(self, weight, vec_weight=[], position_gaussian_params={}, orientation_gaussian_params={}, tensor_args={'device':"cpu", 'dtype':torch.float32}, hinge_val=100.0,
+    def __init__(self, weight, discount=1, vec_weight=[], position_gaussian_params={}, orientation_gaussian_params={}, tensor_args={'device':"cpu", 'dtype':torch.float32}, hinge_val=100.0,
                  convergence_val=[0.0,0.0]):
         super(TrajectoryCost, self).__init__()
         self.tensor_args = tensor_args
         self.I = torch.eye(3, 3, **tensor_args)
         self.weight = weight
+        self.discount = discount
         self.vec_weight = torch.as_tensor(vec_weight, **tensor_args)
         self.rot_weight = self.vec_weight[0:3]
         self.pos_weight = self.vec_weight[3:6]
@@ -129,6 +130,9 @@ class TrajectoryCost(nn.Module):
         pos_err[pos_err < self.convergence_val[1]] = 0.0
         cost = self.weight[0] * self.orientation_gaussian(torch.sqrt(rot_err)) + self.weight[1] * self.position_gaussian(torch.sqrt(pos_err))
 
-        return cost.to(inp_device), rot_err_norm, goal_dist
+        powers = torch.arange(horizon, **self.tensor_args).unsqueeze(0)
+        discounted_cost = cost * torch.pow(self.discount, powers)
+
+        return discounted_cost.to(inp_device), rot_err_norm, goal_dist
 
 
