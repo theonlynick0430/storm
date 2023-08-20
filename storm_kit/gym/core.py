@@ -193,11 +193,10 @@ class World(object):
     def set_root_tensor_state(self, pose, actor_handle):
         _root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         root_tensor = gymtorch.wrap_tensor(_root_tensor)
-        quat = matrix_to_quaternion(pose[:3, :3].unsqueeze(0))[0]
+        quat = matrix_to_quaternion(pose[:3, :3].unsqueeze(0)).squeeze(0)
         quat_formatted = quat.clone()
         quat_formatted[:3] = quat[1:]
         quat_formatted[-1] = quat[0]
-        state = torch.zeros(13, **self.tensor_args)
         idx = self.gym.get_actor_index(self.env_ptr, actor_handle, gymapi.DOMAIN_SIM)
         root_tensor[idx, :3] = pose[:3, 3]
         root_tensor[idx, 3:7] = quat_formatted
