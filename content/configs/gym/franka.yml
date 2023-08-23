@@ -37,7 +37,7 @@ sim_params:
     flip_visual_attachments: True
     armature: 0.001
     disable_gravity: True
-    collapse_fixed_joints: True
+    collapse_fixed_joints: False
   camera:
     label_map: {'robot':2, 'ground':0}
 

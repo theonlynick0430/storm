@@ -40,6 +40,8 @@ class Gym(object):
             physics_engine = gymapi.SIM_FLEX
         # create physics engine struct
         sim_engine_params = gymapi.SimParams()
+        sim_engine_params.use_gpu_pipeline = True
+        sim_engine_params.physx.use_gpu = True
         
         # find params in kwargs and fill up here:
         sim_engine_params = load_struct_from_dict(sim_engine_params, sim_params)

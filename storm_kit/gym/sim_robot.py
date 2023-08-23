@@ -31,13 +31,21 @@ from quaternion import from_rotation_matrix, as_float_array, as_rotation_matrix,
 try:
     from  isaacgym import gymapi
     from isaacgym import gymutil
+    from isaacgym import gymtorch
 except Exception:
     print("ERROR: gym not loaded, this is okay when generating doc")
 
 import torch
-
+from storm_kit.differentiable_robot_model.coordinate_transform import quaternion_to_matrix, matrix_to_quaternion, CoordinateTransform
 from .helpers import load_struct_from_dict
 from ..util_file import join_path
+
+def pose_from(pos, quat, tensor_args):
+    rot_mat = quaternion_to_matrix(quat.unsqueeze(0))[0]
+    pose = torch.eye(4, **tensor_args)
+    pose[:3, :3] = rot_mat
+    pose[:3, 3] = pos
+    return pose
 
 def inv_transform(gym_transform):
     mat = np.eye(4)
@@ -100,72 +108,96 @@ class RobotSim():
         #print(asset_options.disable_gravity)
         return robot_asset
 
-    def spawn_robot(self, env_handle, robot_pose, robot_asset=None, coll_id=-1, init_state=None):
+    def spawn_robot(self, env_handle, robot_pose, robot_asset=None, coll_id=-1):
+        self.env_handle = env_handle
+        self.robot_name = "robot"
+        self.tensor_args = {'device':torch.device("cuda", 0), 'dtype':torch.float32}
+        self.controller = "ik"
         p = gymapi.Vec3(robot_pose[0], robot_pose[1], robot_pose[2])
         robot_pose = gymapi.Transform(p=p, r=gymapi.Quat(robot_pose[3], robot_pose[4], robot_pose[5], robot_pose[6]))
         self.spawn_robot_pose = robot_pose
-        # also store inverse:
-        #self.inv_robot_pose = self.spawn_robot_pose.inverse()
         
         if(robot_asset is None):
             robot_asset = self.robot_asset
-        robot_handle = self.gym.create_actor(env_handle, robot_asset,
-                                             robot_pose, 'robot', coll_id, coll_id, self.ROBOT_SEG_LABEL) # coll_id, mask_filter, mask_vision
+        self.robot_handle = self.gym.create_actor(self.env_handle, robot_asset,
+                                             robot_pose, self.robot_name, coll_id, coll_id, self.ROBOT_SEG_LABEL) # coll_id, mask_filter, mask_vision
 
-        # set friction prop:
-        shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, robot_handle)
-        for i in range(len(shape_props)):
-            shape_props[i].friction = 1.5
-        self.gym.set_actor_rigid_shape_properties(env_handle,robot_handle,shape_props)
+        self.shape_props = self.gym.get_actor_rigid_shape_properties(self.env_handle, self.robot_handle)
+        for i in range(len(self.shape_props)):
+            self.shape_props[i].friction = 1.5
+        self.gym.set_actor_rigid_shape_properties(self.env_handle, self.robot_handle, self.shape_props)
         
-        # set initial position:
-        robot_joint_names = self.gym.get_actor_dof_names(env_handle, robot_handle)
-        self.joint_names = robot_joint_names
-            
-        # todo - move to shared data
-        # get joint limits and ranges for robot
-        robot_dof_props = self.gym.get_actor_dof_properties(env_handle, robot_handle)
+        self.joint_names = self.gym.get_actor_dof_names(self.env_handle, self.robot_handle)
+        self.sim_dof_count = self.gym.get_sim_dof_count(self.sim)
+        self.dof = self.gym.get_actor_dof_count(self.env_handle, self.robot_handle)
+        self.dof_idx = self.gym.get_actor_dof_index(self.env_handle, self.robot_handle, 0, gymapi.DOMAIN_SIM)
+        self.rb_count = self.gym.get_actor_rigid_body_count(self.env_handle, self.robot_handle)
+        self.rb_idx = self.gym.get_actor_rigid_body_index(self.env_handle, self.robot_handle, 0, gymapi.DOMAIN_SIM)
+        self.rs_idx = self.gym.get_actor_index(self.env_handle, self.robot_handle, gymapi.DOMAIN_SIM)
+        self.actor_indices = gymtorch.unwrap_tensor(torch.arange(self.dof_idx, self.dof_idx+self.dof, 
+                                                                 dtype=torch.int32, device=self.tensor_args['device']))
+        franka_link_dict = self.gym.get_asset_rigid_body_dict(self.robot_asset)
+        self.ee_link_idx = franka_link_dict["ee_link"]
 
-        self.dof = len(robot_dof_props['effort'])
-
-        robot_lower_limits = robot_dof_props['lower']
-        robot_upper_limits = robot_dof_props['upper']
+        self.robot_dof_props = self.gym.get_actor_dof_properties(self.env_handle, self.robot_handle)
+        self.robot_lower_limits = self.robot_dof_props["lower"]
+        self.robot_upper_limits = self.robot_dof_props["upper"]
+        if self.controller == "ik":
+            self.robot_dof_props["driveMode"][:7].fill(gymapi.DOF_MODE_POS)
+            self.robot_dof_props["stiffness"][:7].fill(400.0)
+            self.robot_dof_props["damping"][:7].fill(40.0)
+        else: # osc
+            self.robot_dof_props["driveMode"][:7].fill(gymapi.DOF_MODE_EFFORT)
+            self.robot_dof_props["stiffness"][:7].fill(0.0)
+            self.robot_dof_props["damping"][:7].fill(0.0)
+        if self.init_state is None:
+            robot_mids = 0.5 * (self.robot_upper_limits + self.robot_lower_limits)
+            self.init_state = torch.tensor(robot_mids, **self.tensor_args).cpu().numpy()
+        self.gym.set_actor_dof_properties(self.env_handle, self.robot_handle, self.robot_dof_props)  
+        self.gym.set_actor_dof_position_targets(self.env_handle, self.robot_handle, self.init_state)   
         
-        if(init_state is None):
-            if(self.init_state is None):
-                init_state = (robot_lower_limits + robot_upper_limits) / 2 
-            else:
-                init_state = self.init_state
-        self.init_state = init_state
-
-        # for torque control:
-        #robot_dof_props['driveMode'].fill(gymapi.DOF_MODE_EFFORT)
-        #robot_dof_props['stiffness'].fill(0.0) # = self.joint_stiffnness[:self.num_dofs]
-        #robot_dof_props['damping'].fill(0.0) # To avoidxb oscilaatuions?
-
-        # for position control:
-        robot_dof_props['driveMode'].fill(gymapi.DOF_MODE_POS)
-        robot_dof_props['stiffness'].fill(400.0) # = self.joint_stiffnness[:self.num_dofs]
-        robot_dof_props['damping'].fill(40.0) # To avoidxb oscilaatuions?
-        robot_dof_props['stiffness'][-2:] = 100.0
-        robot_dof_props['damping'][-2:] = 5.0
-        
-
-        self.gym.set_actor_dof_properties(env_handle, robot_handle, robot_dof_props)            
-        
-        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(env_handle, robot_handle,
-                                                                       gymapi.STATE_ALL))
-
-        for i in range(len(robot_dof_states['pos'])):
+        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(self.env_handle, self.robot_handle, gymapi.STATE_ALL))
+        for i in range(self.dof):
             robot_dof_states['pos'][i] = self.init_state[i]
             robot_dof_states['vel'][i] = 0.0
         self.init_robot_state = robot_dof_states
-        self.gym.set_actor_dof_states(env_handle, robot_handle, robot_dof_states, gymapi.STATE_ALL)
+        self.gym.set_actor_dof_states(self.env_handle, self.robot_handle, self.init_robot_state, gymapi.STATE_ALL)
 
         if(self.collision_model_params is not None):
-            self.init_collision_model(self.collision_model_params, env_handle, robot_handle)
+            self.init_collision_model(self.collision_model_params, self.env_handle, self.robot_handle)
 
-        return robot_handle
+        return self.robot_handle
+    
+    def init_tensor_api(self):
+        # all tensors will automatically update on refresh 
+        _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "robot")
+        jacobian = gymtorch.wrap_tensor(_jacobian)
+        print("EE LINK IDX")
+        print(self.ee_link_idx)
+        self.j_eef = jacobian[:, self.ee_link_idx-1, :, :7]
+
+        _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "robot")
+        mm = gymtorch.wrap_tensor(_massmatrix)
+        self.mm = mm[:, :7, :7] 
+
+        _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        self.dof_states = gymtorch.wrap_tensor(_dof_states)
+        self.dof_pos = self.dof_states[0:7, 0]
+        self.dof_vel = self.dof_states[0:7, 1]
+
+        _rb_states = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        self.rb_states = gymtorch.wrap_tensor(_rb_states)
+        # in world frame
+        self.ee_pos = self.rb_states[self.rb_idx+self.rb_count-1, :3]
+        self.ee_quat = self.rb_states[self.rb_idx+self.rb_count-1, 3:7]
+        self.ee_vel = self.rb_states[self.rb_idx+self.rb_count-1, 7:]
+
+        _root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
+        self.root_tensor = gymtorch.wrap_tensor(_root_tensor)
+        self.rs_pos = self.root_tensor[self.rs_idx, 0:3]
+        self.rs_quat = self.root_tensor[self.rs_idx, 3:7]
+        self.rs_vel = self.root_tensor[self.rs_idx, 7:]
+
     def get_state(self, env_handle, robot_handle):
         robot_state = self.gym.get_actor_dof_states(env_handle, robot_handle, gymapi.STATE_ALL)
         
@@ -181,6 +213,35 @@ class RobotSim():
         
         return joint_state
     
+    def get_state2(self):
+        # _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        # self.dof_states = gymtorch.wrap_tensor(_dof_states)
+        # self.dof_pos = self.dof_states[0:7, 0]
+        # self.dof_vel = self.dof_states[0:7, 1]
+        # reformat state to be similar ros jointstate:
+        joint_state = {'name':self.joint_names, 'position':[], 'velocity':[], 'acceleration':[]}
+        joint_state['position'] = self.dof_pos.cpu().numpy()
+        joint_state['velocity'] = self.dof_vel.cpu().numpy()
+        joint_state['acceleration'] = np.zeros_like(joint_state['velocity'])
+        return joint_state
+    
+    def get_ee_pose(self):
+        print("GETTING EE POSE")
+        duh = copy.deepcopy(self.ee_quat)
+        w = self.ee_quat[-1]
+        duh[1:] = self.ee_quat[:3]
+        duh[0] = w
+        duh2 = copy.deepcopy(self.rs_quat)
+        w2 = self.rs_quat[-1]
+        duh2[1:] = self.rs_quat[:3]
+        duh2[0] = w2
+        print(self.rs_pos)
+        print(self.rs_quat)
+        print(duh2)
+        print(self.ee_pos)
+        print(self.ee_quat)
+        print(duh)
+        return pose_from(copy.deepcopy(self.ee_pos), duh, self.tensor_args)
 
     def command_robot(self, tau, env_handle, robot_handle):
         self.gym.apply_actor_dof_efforts(env_handle, robot_handle, np.float32(tau))
@@ -188,6 +249,29 @@ class RobotSim():
     def command_robot_position(self, q_des, env_handle, robot_handle):
         self.gym.set_actor_dof_position_targets(env_handle, robot_handle, np.float32(q_des))
 
+    def command_robot_position2(self, pos):
+        # _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
+        # self.dof_states = gymtorch.wrap_tensor(_dof_states)
+        # self.dof_pos = self.dof_states[0:7, 0]
+        # self.dof_vel = self.dof_states[0:7, 1]
+        pos_action = copy.deepcopy(self.dof_states)[:, 0]
+        pos_action[0:7] = pos
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action.contiguous()))
+
+    def control(self, dpose):
+        if self.controller == "osc":
+            return self.control_osc(dpose).squeeze(0)
+        else: # ik
+            return self.dof_pos + self.control_ik(dpose).squeeze(0)
+
+    def control_ik(self, dpose):
+        print("CONTROL")
+        print(dpose)
+        print(self.j_eef)
+        j_eef_T = torch.transpose(self.j_eef, 1, 2)
+        lmbda = torch.eye(6, **self.tensor_args) * (0.05 ** 2)
+        u = (j_eef_T @ torch.inverse(self.j_eef @ j_eef_T + lmbda) @ dpose).view(1, 7)
+        return u
 
     def set_robot_state(self, q_des, qd_des, env_handle, robot_handle):
         robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(env_handle, robot_handle,
