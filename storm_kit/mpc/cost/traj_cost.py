@@ -94,9 +94,9 @@ class TrajectoryCost(nn.Module):
             # generate necessary mats
             ee_rot_diag = torch.block_diag(*ee_rot_traj)
             ee_goal_rot_diag = torch.block_diag(*ee_goal_rot_traj)
-            ee_pos_col = ee_pos_traj.view(-1, 1)
-            ee_goal_pos_col = ee_goal_pos_traj.view(-1, 1)
-            ee_rot_col = ee_rot_traj.view(-1, 3)
+            ee_pos_col = ee_pos_traj.reshape(-1, 1)
+            ee_goal_pos_col = ee_goal_pos_traj.reshape(-1, 1)
+            ee_rot_col = ee_rot_traj.reshape(-1, 3)
 
             # convention: x_T_y -> transformation from frame y to x
 
@@ -109,8 +109,8 @@ class TrajectoryCost(nn.Module):
             ee_t_g = o_t_g + ee_t_o
         
             # reshape after mat mult is done
-            ee_R_g = ee_R_g.view(-1, 3, 3)
-            ee_t_g = ee_t_g.view(-1, 3)
+            ee_R_g = ee_R_g.reshape(-1, 3, 3)
+            ee_t_g = ee_t_g.reshape(-1, 3)
 
             goal_dist[i, :] = torch.norm(self.pos_weight * ee_t_g, p=2, dim=-1)
             pos_err[i, :] = (torch.sum(torch.square(self.pos_weight * ee_t_g), dim=-1))

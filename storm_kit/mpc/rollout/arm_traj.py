@@ -56,8 +56,8 @@ class ArmTrajectory(ArmBase):
         state_batch = state_dict['state_seq']
         
         goal_cost, rot_err_norm, goal_dist = self.goal_cost.forward(ee_pos_batch, ee_rot_batch,
-                                                                    copy.deepcopy(self.ee_goal_pos_traj[self.active_idx:self.active_idx+1]), 
-                                                                    copy.deepcopy(self.ee_goal_rot_traj[self.active_idx:self.active_idx+1]))
+                                                                    copy.deepcopy(self.ee_goal_pos_traj[self.active_idx:]), 
+                                                                    copy.deepcopy(self.ee_goal_rot_traj[self.active_idx:]))
         cost += goal_cost
 
         if(return_dist):

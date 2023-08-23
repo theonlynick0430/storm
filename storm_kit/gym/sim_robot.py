@@ -30,59 +30,31 @@ import numpy as np
 from quaternion import from_rotation_matrix, as_float_array, as_rotation_matrix, as_quat_array
 try:
     from  isaacgym import gymapi
-    from isaacgym import gymutil
     from isaacgym import gymtorch
 except Exception:
     print("ERROR: gym not loaded, this is okay when generating doc")
 
 import torch
-from storm_kit.differentiable_robot_model.coordinate_transform import quaternion_to_matrix, matrix_to_quaternion, CoordinateTransform
 from .helpers import load_struct_from_dict
-from ..util_file import join_path
+from .utils import *
 
-def pose_from(pos, quat, tensor_args):
-    rot_mat = quaternion_to_matrix(quat.unsqueeze(0))[0]
-    pose = torch.eye(4, **tensor_args)
-    pose[:3, :3] = rot_mat
-    pose[:3, 3] = pos
-    return pose
 
-def inv_transform(gym_transform):
-    mat = np.eye(4)
-    mat[0:3, 3] = np.ravel([gym_transform.p.x,gym_transform.p.y, gym_transform.p.z])
-    # get rotation matrix from quat:
-    q = gym_transform.r
-
-    rot = as_rotation_matrix(as_quat_array([q.w, q.x, q.y, q.z]))
-    mat[0:3, 0:3] = rot
-    inv_mat = np.linalg.inv(mat)
-
-    quat = as_float_array(from_rotation_matrix(inv_mat[0:3,0:3]))
-    new_transform = gymapi.Transform(p=gymapi.Vec3(inv_mat[0,3], inv_mat[1,3],
-                                                   inv_mat[2,3]),
-                                     r=gymapi.Quat(quat[1],
-                                                   quat[2],
-                                                   quat[3],
-                                                   quat[0]))
-    
-    return new_transform
-# Write some helper functions:
-def pose_from_gym(gym_pose):
-    pose = np.array([gym_pose.p.x, gym_pose.p.y, gym_pose.p.z,
-                     gym_pose.r.x, gym_pose.r.y, gym_pose.r.z, gym_pose.r.w])
-    return pose
+# OSC params
+kp = 150.
+kd = 2.0 * np.sqrt(kp)
+kp_null = 10.
+kd_null = 2.0 * np.sqrt(kp_null)
+# IK params
+damping = 0.05
 
 class RobotSim():
-    def __init__(self, device='cpu', gym_instance=None, sim_instance=None,
+    def __init__(self, controller="ik", tensor_args={'device':'cpu', 'dtype':torch.float32}, gym_instance=None, sim_instance=None,
                  asset_root='', sim_urdf='', asset_options='', init_state=None, collision_model=None, **kwargs):
         self.gym = gym_instance
         self.sim = sim_instance
-        self.device = device
-        self.dof = None
+        self.controller = controller
+        self.tensor_args = tensor_args
         self.init_state = init_state
-        self.joint_names = []
-        robot_asset_options = gymapi.AssetOptions()
-        robot_asset_options = load_struct_from_dict(robot_asset_options, asset_options)
 
         self.camera_handle = None
         self.collision_model_params = collision_model
@@ -90,36 +62,31 @@ class RobotSim():
         self.ENV_SEG_LABEL = 1
         self.ROBOT_SEG_LABEL = 2
         
+        robot_asset_options = gymapi.AssetOptions()
+        robot_asset_options = load_struct_from_dict(robot_asset_options, asset_options)
         self.robot_asset = self.load_robot_asset(sim_urdf,
                                                  robot_asset_options,
                                                  asset_root)
 
-        
     def init_sim(self, gym_instance, sim_instance):
         self.gym = gym_instance
         self.sim = sim_instance
         
     def load_robot_asset(self, sim_urdf, asset_options, asset_root):
-
         if ((self.gym is None) or (self.sim is None)):
             raise AssertionError
         robot_asset = self.gym.load_asset(self.sim, asset_root,
                                           sim_urdf, asset_options)
-        #print(asset_options.disable_gravity)
         return robot_asset
 
-    def spawn_robot(self, env_handle, robot_pose, robot_asset=None, coll_id=-1):
+    def spawn_robot(self, env_handle, robot_pose, robot_name="robot", coll_id=-1):
         self.env_handle = env_handle
-        self.robot_name = "robot"
-        self.tensor_args = {'device':torch.device("cuda", 0), 'dtype':torch.float32}
-        self.controller = "ik"
+        self.robot_name = robot_name
+
         p = gymapi.Vec3(robot_pose[0], robot_pose[1], robot_pose[2])
         robot_pose = gymapi.Transform(p=p, r=gymapi.Quat(robot_pose[3], robot_pose[4], robot_pose[5], robot_pose[6]))
         self.spawn_robot_pose = robot_pose
-        
-        if(robot_asset is None):
-            robot_asset = self.robot_asset
-        self.robot_handle = self.gym.create_actor(self.env_handle, robot_asset,
+        self.robot_handle = self.gym.create_actor(self.env_handle, self.robot_asset,
                                              robot_pose, self.robot_name, coll_id, coll_id, self.ROBOT_SEG_LABEL) # coll_id, mask_filter, mask_vision
 
         self.shape_props = self.gym.get_actor_rigid_shape_properties(self.env_handle, self.robot_handle)
@@ -172,8 +139,7 @@ class RobotSim():
         # all tensors will automatically update on refresh 
         _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "robot")
         jacobian = gymtorch.wrap_tensor(_jacobian)
-        print("EE LINK IDX")
-        print(self.ee_link_idx)
+        # base fixed so that link is not included in jac
         self.j_eef = jacobian[:, self.ee_link_idx-1, :, :7]
 
         _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "robot")
@@ -197,28 +163,8 @@ class RobotSim():
         self.rs_pos = self.root_tensor[self.rs_idx, 0:3]
         self.rs_quat = self.root_tensor[self.rs_idx, 3:7]
         self.rs_vel = self.root_tensor[self.rs_idx, 7:]
-
-    def get_state(self, env_handle, robot_handle):
-        robot_state = self.gym.get_actor_dof_states(env_handle, robot_handle, gymapi.STATE_ALL)
-        
-        # reformat state to be similar ros jointstate:
-        joint_state = {'name':self.joint_names, 'position':[], 'velocity':[], 'acceleration':[]}
-
-        for i in range(len(robot_state)):
-            joint_state['position'].append(robot_state[i][0])
-            joint_state['velocity'].append(robot_state[i][1])
-        joint_state['position'] = np.ravel(joint_state['position'])
-        joint_state['velocity'] = np.ravel(joint_state['velocity'])
-        joint_state['acceleration'] = np.ravel(joint_state['velocity'])*0.0
-        
-        return joint_state
     
-    def get_state2(self):
-        # _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
-        # self.dof_states = gymtorch.wrap_tensor(_dof_states)
-        # self.dof_pos = self.dof_states[0:7, 0]
-        # self.dof_vel = self.dof_states[0:7, 1]
-        # reformat state to be similar ros jointstate:
+    def get_state(self):
         joint_state = {'name':self.joint_names, 'position':[], 'velocity':[], 'acceleration':[]}
         joint_state['position'] = self.dof_pos.cpu().numpy()
         joint_state['velocity'] = self.dof_vel.cpu().numpy()
@@ -226,38 +172,30 @@ class RobotSim():
         return joint_state
     
     def get_ee_pose(self):
-        print("GETTING EE POSE")
-        duh = copy.deepcopy(self.ee_quat)
-        w = self.ee_quat[-1]
-        duh[1:] = self.ee_quat[:3]
-        duh[0] = w
-        duh2 = copy.deepcopy(self.rs_quat)
-        w2 = self.rs_quat[-1]
-        duh2[1:] = self.rs_quat[:3]
-        duh2[0] = w2
-        print(self.rs_pos)
-        print(self.rs_quat)
-        print(duh2)
-        print(self.ee_pos)
-        print(self.ee_quat)
-        print(duh)
-        return pose_from(copy.deepcopy(self.ee_pos), duh, self.tensor_args)
+        return pose_from(self.ee_pos.unsqueeze(0), self.ee_quat.unsqueeze(0), self.tensor_args)
 
-    def command_robot(self, tau, env_handle, robot_handle):
-        self.gym.apply_actor_dof_efforts(env_handle, robot_handle, np.float32(tau))
-        
-    def command_robot_position(self, q_des, env_handle, robot_handle):
-        self.gym.set_actor_dof_position_targets(env_handle, robot_handle, np.float32(q_des))
+    def command_robot(self, action):
+        if self.controller == "osc":
+            self.command_robot_effort(action)
+        else: #ik 
+            self.command_robot_position(action)
 
-    def command_robot_position2(self, pos):
-        # _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
-        # self.dof_states = gymtorch.wrap_tensor(_dof_states)
-        # self.dof_pos = self.dof_states[0:7, 0]
-        # self.dof_vel = self.dof_states[0:7, 1]
+    def command_robot_effort(self, effort):
+        effort_action = torch.zeros(self.sim_dof_count, **self.tensor_args)
+        effort_action[self.dof_idx:self.dof_idx+self.dof] = effort
+        self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(effort_action.contiguous()))
+                
+    def command_robot_position(self, pos):
         pos_action = copy.deepcopy(self.dof_states)[:, 0]
-        pos_action[0:7] = pos
+        pos_action[self.dof_idx:self.dof_idx+self.dof] = pos
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action.contiguous()))
 
+    """
+    control
+    
+    dpose: (6, 1)
+        - ee_goal_state-ee_curr_state in world frame
+    """
     def control(self, dpose):
         if self.controller == "osc":
             return self.control_osc(dpose).squeeze(0)
@@ -265,23 +203,28 @@ class RobotSim():
             return self.dof_pos + self.control_ik(dpose).squeeze(0)
 
     def control_ik(self, dpose):
-        print("CONTROL")
-        print(dpose)
-        print(self.j_eef)
         j_eef_T = torch.transpose(self.j_eef, 1, 2)
-        lmbda = torch.eye(6, **self.tensor_args) * (0.05 ** 2)
+        lmbda = torch.eye(6, **self.tensor_args) * (damping ** 2)
         u = (j_eef_T @ torch.inverse(self.j_eef @ j_eef_T + lmbda) @ dpose).view(1, 7)
         return u
 
-    def set_robot_state(self, q_des, qd_des, env_handle, robot_handle):
-        robot_dof_states = copy.deepcopy(self.gym.get_actor_dof_states(env_handle, robot_handle,
-                                                                       gymapi.STATE_ALL))
+    def control_osc(self, dpose):
+        mm_inv = torch.inverse(self.mm)
+        m_eef_inv = self.j_eef @ mm_inv @ torch.transpose(self.j_eef, 1, 2)
+        m_eef = torch.inverse(m_eef_inv)
+        u = torch.transpose(self.j_eef, 1, 2) @ m_eef @ (
+            kp * dpose - kd * self.ee_vel.unsqueeze(-1))
 
-        for i in range(len(robot_dof_states['pos'])):
-            robot_dof_states['pos'][i] = q_des[i]
-            robot_dof_states['vel'][i] = qd_des[i]
-        self.init_robot_state = robot_dof_states
-        self.gym.set_actor_dof_states(env_handle, robot_handle, robot_dof_states, gymapi.STATE_ALL)
+        # Nullspace control torques `u_null` prevents large changes in joint configuration
+        # They are added into the nullspace of OSC so that the end effector orientation remains constant
+        # roboticsproceedings.org/rss07/p31.pdf
+        j_eef_inv = m_eef @ self.j_eef @ mm_inv
+        u_null = kd_null * -self.dof_vel.view(1, self.dof, 1) + kp_null * (
+            (self.init_state.view(1, -1, 1) - self.dof_pos.view(1, self.dof, 1) + np.pi) % (2 * np.pi) - np.pi)
+        u_null = u_null[:, :7]
+        u_null = self.mm @ u_null
+        u += (torch.eye(7, **self.tensor_args).unsqueeze(0) - torch.transpose(self.j_eef, 1, 2) @ j_eef_inv) @ u_null
+        return u.squeeze(-1)
 
     def update_collision_model(self, link_poses, env_ptr, robot_handle):
         w_T_r = self.spawn_robot_pose
