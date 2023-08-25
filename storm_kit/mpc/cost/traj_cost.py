@@ -25,17 +25,16 @@ import torch.nn as nn
 # import torch.nn.functional as F
 
 from .gaussian_projection import GaussianProjection
-
+from ...differentiable_robot_model.coordinate_transform import matrix_to_euler_angles
 class TrajectoryCost(nn.Module):
 
     def __init__(self, weight, vec_weight=[], position_gaussian_params={}, orientation_gaussian_params={}, tensor_args={'device':"cpu", 'dtype':torch.float32}, hinge_val=100.0,
                  convergence_val=[0.0,0.0]):
         super(TrajectoryCost, self).__init__()
         self.tensor_args = tensor_args
-        self.I = torch.eye(3, 3, **tensor_args)
         self.weight = weight
         self.vec_weight = torch.as_tensor(vec_weight, **tensor_args)
-        self.rot_weight = self.vec_weight[0:3]
+        self.ori_weight = self.vec_weight[0:3]
         self.pos_weight = self.vec_weight[3:6]
 
         self.px = torch.tensor([1.0,0.0,0.0], **self.tensor_args).T
@@ -68,7 +67,6 @@ class TrajectoryCost(nn.Module):
         ee_goal_rot_traj = ee_goal_rot_traj.to(device=self.device,
                                      dtype=self.dtype)
         
-        batch_size = ee_pos_batch.shape[0]
         horizon = ee_pos_batch.shape[1]
 
         if ee_goal_pos_traj.shape[0] > horizon:
@@ -81,51 +79,15 @@ class TrajectoryCost(nn.Module):
             ee_goal_pos_traj = torch.cat([ee_goal_pos_traj, last_val_pos.repeat(repeats, 1)])
             ee_goal_rot_traj = torch.cat([ee_goal_rot_traj, last_val_rot.repeat(repeats, 1, 1)])
 
-        cost = torch.zeros((batch_size, horizon), **self.tensor_args)
-        goal_dist = torch.zeros((batch_size, horizon), **self.tensor_args)
-        pos_err = torch.zeros((batch_size, horizon), **self.tensor_args)
-        rot_err_norm = torch.zeros((batch_size, horizon), **self.tensor_args)
-        rot_err = torch.zeros((batch_size, horizon), **self.tensor_args)
-        
-        for i in range(batch_size):
-            ee_pos_traj = ee_pos_batch[i]
-            ee_rot_traj = ee_rot_batch[i]
-
-            # generate necessary mats
-            ee_rot_diag = torch.block_diag(*ee_rot_traj)
-            ee_goal_rot_diag = torch.block_diag(*ee_goal_rot_traj)
-            ee_pos_col = ee_pos_traj.reshape(-1, 1)
-            ee_goal_pos_col = ee_goal_pos_traj.reshape(-1, 1)
-            ee_rot_col = ee_rot_traj.reshape(-1, 3)
-
-            # convention: x_T_y -> transformation from frame y to x
-
-            # all transformation in robot frame
-            w_R_g = ee_goal_rot_diag.t() # inverse
-            ee_R_g = w_R_g @ ee_rot_col
-            o_t_g = -1.0 * w_R_g @ ee_goal_pos_col
-            w_T_ee = ee_rot_diag.t() # inverse 
-            ee_t_o = w_T_ee @ ee_pos_col
-            ee_t_g = o_t_g + ee_t_o
-        
-            # reshape after mat mult is done
-            ee_R_g = ee_R_g.reshape(-1, 3, 3)
-            ee_t_g = ee_t_g.reshape(-1, 3)
-
-            goal_dist[i, :] = torch.norm(self.pos_weight * ee_t_g, p=2, dim=-1)
-            pos_err[i, :] = (torch.sum(torch.square(self.pos_weight * ee_t_g), dim=-1))
-            _rot_err = self.I - ee_R_g
-            _rot_err = torch.norm(_rot_err, dim=-1)
-            rot_err_norm[i, :] = torch.norm(self.rot_weight * _rot_err, p=2, dim=-1)
-            rot_err[i, :] = torch.square(torch.sum(self.rot_weight * _rot_err, dim=-1))
-
-        if(self.hinge_val > 0.0):
-            rot_err = torch.where(goal_dist <= self.hinge_val, rot_err, self.Z) #hard hinge
-
-        rot_err[rot_err < self.convergence_val[0]] = 0.0
+        goal2ee_trans = ee_pos_batch - ee_goal_pos_traj
+        goal2ee_rot = ee_goal_rot_traj.transpose(-1, -2) @ ee_rot_batch
+        goal2ee_eul = matrix_to_euler_angles(goal2ee_rot)
+        pos_err = torch.norm(self.pos_weight * goal2ee_trans, dim=-1)
+        ori_err = torch.norm(self.ori_weight * goal2ee_eul, dim=-1)
+        ori_err[ori_err < self.convergence_val[0]] = 0.0
         pos_err[pos_err < self.convergence_val[1]] = 0.0
-        cost = self.weight[0] * self.orientation_gaussian(torch.sqrt(rot_err)) + self.weight[1] * self.position_gaussian(torch.sqrt(pos_err))
+        cost = self.weight[0] * self.orientation_gaussian(ori_err) + self.weight[1] * self.position_gaussian(pos_err)
 
-        return cost.to(inp_device), rot_err_norm, goal_dist
+        return cost.to(inp_device), ori_err, pos_err
 
 
