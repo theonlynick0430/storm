@@ -39,12 +39,12 @@ class TrajectoryTask(ArmTask):
        :parts: 1
 
     """
-    def __init__(self, task_file='ur10.yml', robot_file='ur10_reacher.yml', world_file='collision_env.yml', tensor_args={'device':"cpu", 'dtype':torch.float32}):
-        
+    def __init__(self, obj_grasp, task_file='ur10.yml', robot_file='ur10_reacher.yml', world_file='collision_env.yml', tensor_args={'device':"cpu", 'dtype':torch.float32}):
+        self.obj_grasp = obj_grasp
         super().__init__(task_file=task_file, robot_file=robot_file,
                          world_file=world_file, tensor_args=tensor_args)
 
     def get_rollout_fn(self, **kwargs):
-        rollout_fn = ArmTrajectory(**kwargs)
+        rollout_fn = ArmTrajectory(obj_grasp=self.obj_grasp, **kwargs)
         return rollout_fn
 

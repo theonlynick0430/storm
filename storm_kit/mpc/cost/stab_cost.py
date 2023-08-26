@@ -26,11 +26,12 @@ import torch.nn as nn
 
 from .gaussian_projection import GaussianProjection
 from ...differentiable_robot_model.coordinate_transform import matrix_to_euler_angles
-class TrajectoryCost(nn.Module):
+
+class StabilizeCost(nn.Module):
 
     def __init__(self, obj_grasp, weight, vec_weight=[], position_gaussian_params={}, orientation_gaussian_params={}, tensor_args={'device':"cpu", 'dtype':torch.float32}, hinge_val=100.0,
                  convergence_val=[0.0,0.0]):
-        super(TrajectoryCost, self).__init__()
+        super(StabilizeCost, self).__init__()
         self.obj_grasp = obj_grasp
         self.tensor_args = tensor_args
         self.weight = weight
@@ -55,44 +56,33 @@ class TrajectoryCost(nn.Module):
     # arg shapes
     # ee_pos_batch: (batch_size, x, 3)
     # ee_rot_batch: (batch_size, x, 3, 3)
-    # obj_goal_pos_traj: (y, 3)
-    # obj_goal_rot_traj: (y, 3, 3))
-    def forward(self, ee_pos_batch, ee_rot_batch, obj_goal_pos_traj, obj_goal_rot_traj):        
+    # obj_init_pos: (3)
+    # obj_init_rot: (3, 3))
+    def forward(self, ee_pos_batch, ee_rot_batch, obj_init_pos, obj_init_rot):        
         inp_device = ee_pos_batch.device
         ee_pos_batch = ee_pos_batch.to(device=self.device,
                                        dtype=self.dtype)
         ee_rot_batch = ee_rot_batch.to(device=self.device,
                                        dtype=self.dtype)
-        obj_goal_pos_traj = obj_goal_pos_traj.to(device=self.device,
+        obj_init_pos = obj_init_pos.to(device=self.device,
                                      dtype=self.dtype)
-        obj_goal_rot_traj = obj_goal_rot_traj.to(device=self.device,
+        obj_init_rot = obj_init_rot.to(device=self.device,
                                      dtype=self.dtype)
         
         batch_size = ee_pos_batch.shape[0]
         horizon = ee_pos_batch.shape[1]
-        
-        # make batch and goal horizon match
-        if obj_goal_pos_traj.shape[0] > horizon:
-            obj_goal_pos_traj = obj_goal_pos_traj[:horizon]
-            obj_goal_rot_traj = obj_goal_rot_traj[:horizon]
-        elif obj_goal_pos_traj.shape[0] < horizon:
-            last_val_pos = obj_goal_pos_traj[-1:]
-            last_val_rot = obj_goal_rot_traj[-1:]
-            repeats = horizon - obj_goal_pos_traj.shape[0]
-            obj_goal_pos_traj = torch.cat([obj_goal_pos_traj, last_val_pos.repeat(repeats, 1)])
-            obj_goal_rot_traj = torch.cat([obj_goal_rot_traj, last_val_rot.repeat(repeats, 1, 1)])
 
         # convert ee pose into obj pose
         obj_pos_batch = self.obj_grasp[:, :3, :3] @ ee_pos_batch.view(batch_size, horizon, 3, 1) + self.obj_grasp[:, :3, 3:4]
         obj_rot_batch = self.obj_grasp[:, :3, :3] @ ee_rot_batch
 
         # compute error in obj frame
-        obj_goal_rot_inv_traj = obj_goal_rot_traj.transpose(-1, -2)
-        goal2ee_trans = obj_goal_rot_inv_traj @ (obj_pos_batch - obj_goal_pos_traj.view(horizon, 3, 1))
-        goal2ee_rot = obj_goal_rot_inv_traj @ obj_rot_batch
-        goal2ee_eul = matrix_to_euler_angles(goal2ee_rot)
-        pos_err = torch.norm(self.pos_weight * goal2ee_trans.squeeze(-1), dim=-1)
-        ori_err = torch.norm(self.ori_weight * goal2ee_eul, dim=-1)
+        obj_init_rot_inv = obj_init_rot.transpose(-1, -2)
+        trans = obj_init_rot_inv @ (obj_pos_batch - obj_init_pos.view(3, 1))
+        rot = obj_init_rot_inv @ obj_rot_batch
+        eul = matrix_to_euler_angles(rot)
+        pos_err = torch.norm(self.pos_weight * trans.squeeze(-1), dim=-1)
+        ori_err = torch.norm(self.ori_weight * eul, dim=-1)
         ori_err[ori_err < self.convergence_val[0]] = 0.0
         pos_err[pos_err < self.convergence_val[1]] = 0.0
         cost = self.weight[0] * self.orientation_gaussian(ori_err) + self.weight[1] * self.position_gaussian(pos_err)

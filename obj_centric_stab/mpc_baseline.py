@@ -136,9 +136,6 @@ def main(args, gym_instance):
     # create world: wrapper around isaac sim to add/manage objects
     world_instance = World(gym, sim, env_handle, world_params, w_T_r=torch_to_transform(w_T_r))
 
-    # mpc control 
-    mpc_control = TrajectoryTask(task_file, robot_file, world_file, tensor_args)
-
     # spawn ee object
     asset_options = gymapi.AssetOptions()
     asset_options.armature = 0.001
@@ -155,21 +152,24 @@ def main(args, gym_instance):
     refresh(gym, sim)
 
     w_T_ee = robot_sim.get_ee_pose()
+    r_T_ee = torch.inverse(w_T_r) @ w_T_ee
     ee_T_obj = torch.eye(4, **tensor_args)
     ee_T_obj[:3, 3] = torch.tensor([0., 0., 0.025], **tensor_args)
-    cube_pose = w_T_ee @ ee_T_obj
-    obj_grasp = torch.inverse(w_T_ee @ ee_T_obj @ torch.inverse(w_T_ee))
+    # converts pose of ee in robot frame to pose of obj in robot frame
+    obj_grasp = r_T_ee @ ee_T_obj @ torch.inverse(r_T_ee)
+    # initial pose of ee in world frame
     init_pose = copy.deepcopy(w_T_ee)
     init_pose[0, :3, :3] = torch.eye(3, **tensor_args)
-    traj = init_pose @ ee_T_obj @ traj # traj now in world frame
-    ee_goal_pose_traj = torch.inverse(w_T_r) @ obj_grasp @ traj
-    # send traj to mpc
-    mpc_control.update_params(ee_goal_pos_traj=ee_goal_pose_traj[:, :3, 3], 
-                              ee_goal_rot_traj=ee_goal_pose_traj[:, :3, :3])
+    obj_goal_pose_traj = torch.inverse(w_T_r) @ init_pose @ ee_T_obj @ traj # in robot frame
 
+    # mpc control 
+    mpc_control = TrajectoryTask(obj_grasp, task_file, robot_file, world_file, tensor_args)
+    # send traj to mpc
+    mpc_control.update_params(obj_goal_pos_traj=obj_goal_pose_traj[:, :3, 3], 
+                              obj_goal_rot_traj=obj_goal_pose_traj[:, :3, :3])
     
     t_step = gym_instance.get_sim_time()
-    linear_action(w_T_r @ ee_goal_pose_traj[0], robot_sim, gym_instance)
+    linear_action(w_T_r @ torch.inverse(obj_grasp) @ obj_goal_pose_traj[0], robot_sim, gym_instance)
     
     # main control loop
     sim_dt = mpc_control.exp_params['control_dt']
