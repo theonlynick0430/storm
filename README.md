@@ -13,16 +13,18 @@ This package contains code for reactive robot motion leveraging parallel compute
 
 ## Object-Centric Stabilization
 Setup the environment: 
-<code>
-cd /scr/niksrid
-source miniconda/bin/activate
-conda activate storm_kit
-cd storm
-source env_setup.sh
-</code>
+  <code>
+  cd /scr/niksrid
+  source miniconda/bin/activate
+  conda activate storm_kit
+  cd storm
+  source env_setup.sh
+  </code>
 
 To run: 
-<code>python obj_centric_stab/mpc_baseline.py -i [data.npy] -t [traj_idx] -dt [time between pose data in sec]</code>
+  <code>
+  python obj_centric_stab/mpc_baseline.py -i [data.npy] -t [traj_idx] -dt [time between pose data in sec]
+  </code>
 
 Other notes: 
 Sometimes, the program will get stuck trying to load from torch cache if it didn't shut down cleanly. 
