@@ -11,6 +11,22 @@ This package contains code for reactive robot motion leveraging parallel compute
   <img width="300" src="docs/images/constrained_storm.gif">
 </p>
 
+## Object-Centric Stabilization
+Setup the environment: 
+<code>
+cd /scr/niksrid
+source miniconda/bin/activate
+conda activate storm_kit
+cd storm
+source env_setup.sh
+</code>
+
+To run: 
+<code>python obj_centric_stab/mpc_baseline.py -i [data.npy] -t [traj_idx] -dt [time between pose data in sec]</code>
+
+Other notes: 
+Sometimes, the program will get stuck trying to load from torch cache if it didn't shut down cleanly. 
+Just delete the torch cache folder and run again. 
 
 ## Updates
 Jan. 2022 - Add CoRL citation, merge torch.size() bug (thanks [@maxpahn](https://github.com/maxspahn)).

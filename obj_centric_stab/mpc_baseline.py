@@ -68,6 +68,15 @@ def refresh(gym, sim):
     gym.refresh_mass_matrix_tensors(sim)
 
 def linear_action(ee_goal_pose, robot_sim: RobotSim, gym_instance, thresh=0.001, max_steps=500):
+    """
+    Uses control suite to navigate robot linearly from current to target pose.
+
+    Args:
+    ee_goal_pose (1 x 4 x 4, torch.tensor): ee goal pose in world frame 
+
+    Returns:
+    success (bool)
+    """
     gym = gym_instance.gym
     sim = gym_instance.sim
     ee_goal_pos = ee_goal_pose[:, :3, 3]
@@ -127,9 +136,10 @@ def main(args, gym_instance):
     robot_pose = sim_params['robot_pose']
     env_handle = gym_instance.env_list[0]
     robot_handle = robot_sim.spawn_robot(env_handle, robot_pose, coll_id=2)
+
+    # convention x_T_y is transformation from frame y to x
     
     # get world transform
-    # convention x_T_y is transformation from frame x to y
     w_T_r = transform_to_torch(copy.deepcopy(robot_sim.spawn_robot_pose), tensor_args)
     w_robot_coord = CoordinateTransform(trans=w_T_r[:, :3, 3],
                                         rot=w_T_r[:, :3, :3])
@@ -155,7 +165,7 @@ def main(args, gym_instance):
     r_T_ee = torch.inverse(w_T_r) @ w_T_ee
     ee_T_obj = torch.eye(4, **tensor_args)
     ee_T_obj[:3, 3] = torch.tensor([0., 0., 0.025], **tensor_args)
-    # converts pose of ee in robot frame to pose of obj in robot frame
+    # obj_grasp converts pose of ee in robot frame to pose of obj in robot frame
     obj_grasp = r_T_ee @ ee_T_obj @ torch.inverse(r_T_ee)
     # initial pose of ee in world frame
     init_pose = copy.deepcopy(w_T_ee)

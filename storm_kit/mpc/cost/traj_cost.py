@@ -52,12 +52,19 @@ class TrajectoryCost(nn.Module):
         self.dtype = self.tensor_args['dtype']
         self.device = self.tensor_args['device']
 
-    # arg shapes
-    # ee_pos_batch: (batch_size, x, 3)
-    # ee_rot_batch: (batch_size, x, 3, 3)
-    # obj_goal_pos_traj: (y, 3)
-    # obj_goal_rot_traj: (y, 3, 3))
-    def forward(self, ee_pos_batch, ee_rot_batch, obj_goal_pos_traj, obj_goal_rot_traj):        
+    def forward(self, ee_pos_batch, ee_rot_batch, obj_goal_pos_traj, obj_goal_rot_traj):     
+        """
+        Computes cost between sampled and goal trajectories using l2 distance.
+
+        Args: 
+        ee_pos_batch (batch_size x horizon x 3, torch.tensor): sampled batch of ee pos in robot frame
+        ee_rot_batch (batch_size x horizon x 3 x 3, torch.tensor): sampled batch of ee rot in robot frame
+        obj_goal_pos_traj (Y x 3, torch.tensor): desired traj of obj pos in robot frame
+        obj_goal_rot_traj (Y x 3 x 3, torch.tensor): desired traj of obj rot in robot frame
+
+        Returns: 
+        cost (batch_size x horizon, torch.tensor): cost matrix that enumerates batch_size and horizon
+        """   
         inp_device = ee_pos_batch.device
         ee_pos_batch = ee_pos_batch.to(device=self.device,
                                        dtype=self.dtype)

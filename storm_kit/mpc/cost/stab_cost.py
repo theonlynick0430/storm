@@ -53,12 +53,21 @@ class StabilizeCost(nn.Module):
         self.dtype = self.tensor_args['dtype']
         self.device = self.tensor_args['device']
 
-    # arg shapes
-    # ee_pos_batch: (batch_size, x, 3)
-    # ee_rot_batch: (batch_size, x, 3, 3)
-    # obj_init_pos: (3)
-    # obj_init_rot: (3, 3))
-    def forward(self, ee_pos_batch, ee_rot_batch, obj_init_pos, obj_init_rot):        
+    def forward(self, ee_pos_batch, ee_rot_batch, obj_init_pos, obj_init_rot):  
+        """
+        Computes cost of sampled trajectories using deviation from initial obj pose. 
+        Once we learn which DOFs of the obj we should stabilize, we can penalize any movement
+        along these DOFs via weight vectors. 
+
+        Args: 
+        ee_pos_batch (batch_size x horizon x 3, torch.tensor): sampled batch of ee pos in robot frame
+        ee_rot_batch (batch_size x horizon x 3 x 3, torch.tensor): sampled batch of ee rot in robot frame
+        obj_init_pos (3, torch.tensor): initial obj pos in robot frame
+        obj_init_rot (3 x 3, torch.tensor): initial obj rot in robot frame
+
+        Returns: 
+        cost (batch_size x horizon, torch.tensor): cost matrix that enumerates batch_size and horizon
+        """        
         inp_device = ee_pos_batch.device
         ee_pos_batch = ee_pos_batch.to(device=self.device,
                                        dtype=self.dtype)

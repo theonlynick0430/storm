@@ -135,8 +135,11 @@ class RobotSim():
 
         return self.robot_handle
     
+    """ 
+    After setting up actors and env, capture sim state from tensor api. 
+    References will automatically update on refresh.
+    """
     def init_tensor_api(self):
-        # all tensors will automatically update on refresh 
         _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "robot")
         jacobian = gymtorch.wrap_tensor(_jacobian)
         # base fixed so that link is not included in jac
@@ -172,6 +175,10 @@ class RobotSim():
         return joint_state
     
     def get_ee_pose(self):
+        """
+        Returns:
+        ee_pose (4 x 4, torch.tensor): ee pose in world frame
+        """
         return pose_from(self.ee_pos.unsqueeze(0), self.ee_quat.unsqueeze(0), self.tensor_args)
 
     def command_robot(self, action):
@@ -190,13 +197,18 @@ class RobotSim():
         pos_action[self.dof_idx:self.dof_idx+self.dof] = pos
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action.contiguous()))
 
-    """
-    control
-    
-    dpose: (6, 1)
-        - ee_goal_state-ee_curr_state in world frame
-    """
     def control(self, dpose):
+        """
+        Uses specified control method to return control associated with delta ee pose.
+
+        Args: 
+        dpose (6 x 1, torch.tensor): delta ee pose in world frame
+            - [:3, :] is the delta pos
+            - [3:, :] is the desired axis angle vector
+
+        Returns: 
+        control (dof_len torch.tensor)
+        """
         if self.controller == "osc":
             return self.control_osc(dpose).squeeze(0)
         else: # ik
